@@ -8,7 +8,7 @@ categories:
     - Mysql
 ---
 
-## 9.1　相关参数
+## 9.1 相关参数
 
 ```mysql
 mysql> show variables like '%profil%';
