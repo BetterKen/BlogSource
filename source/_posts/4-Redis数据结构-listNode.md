@@ -10,6 +10,7 @@ categories:
 ---
 
 
+
 ## 4.1 什么是listNode
 
 listNode就是常规数据结构的一种——链表
