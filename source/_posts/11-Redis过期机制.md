@@ -1,0 +1,760 @@
+---
+title: 11.Redis过期机制
+date: 2020-02-20 17:24:16
+tags:
+    - Redis
+    - 缓存
+categories:
+    - 中间件
+    - Redis
+---
+
+## 11.1 RedisDb结构
+
+每个Redis服务都有多个Db库,每个库记录了不同应用的数据信息
+
+RedisDb的结构如下:
+
+```c
+#file : src/redis.h
+typedef struct redisDb {
+
+    // 数据库键空间，保存着数据库中的所有键值对
+    dict *dict;                 /* The keyspace for this DB */
+    // 键的过期时间，字典的键为键，字典的值为过期事件 UNIX 时间戳
+    dict *expires;              /* Timeout of keys with a timeout set */
+    // 正处于阻塞状态的键
+    dict *blocking_keys;        /* Keys with clients waiting for data (BLPOP) */
+    // 可以解除阻塞的键
+    dict *ready_keys;           /* Blocked keys that received a PUSH */
+    // 正在被 WATCH 命令监视的键
+    dict *watched_keys;         /* WATCHED keys for MULTI/EXEC CAS */
+
+    struct evictionPoolEntry *eviction_pool;    /* Eviction pool of keys */
+    // 数据库号码
+    int id;                     /* Database ID */
+    // 数据库的键的平均 TTL ，统计信息
+    long long avg_ttl;          /* Average TTL, just for stats */
+} redisDb;
+```
+
+![](http://cache410.oss-cn-beijing.aliyuncs.com/redisdb.png)
+
+redisDb结构的expires字典保存了数据库中所有键的过期时间:
+
+- 过期字典的键是一个指针,指向某个键对象
+- 过期字典的值是一个long long 类型的整数,这个整数报错了键所指向数据库的过期时间,是一个毫秒精度的UNIX时间戳
+
+## 11.2 设置过期时间
+
+```c
+#file : src/redis.c
+void expireCommand(redisClient *c) {
+    expireGenericCommand(c,mstime(),UNIT_SECONDS);
+}
+
+void expireatCommand(redisClient *c) {
+    expireGenericCommand(c,0,UNIT_SECONDS);
+}
+
+void pexpireCommand(redisClient *c) {
+    expireGenericCommand(c,mstime(),UNIT_MILLISECONDS);
+}
+
+void pexpireatCommand(redisClient *c) {
+    expireGenericCommand(c,0,UNIT_MILLISECONDS);
+}
+
+/* 
+ * 这个函数是 EXPIRE 、 PEXPIRE 、 EXPIREAT 和 PEXPIREAT 命令的底层实现函数。
+ *
+ * 命令的第二个参数可能是绝对值，也可能是相对值。
+ * 当执行 *AT 命令时， basetime 为 0 ，在其他情况下，它保存的就是当前的绝对时间。
+ *
+ * unit 用于指定 argv[2] （传入过期时间）的格式，
+ * 它可以是 UNIT_SECONDS 或 UNIT_MILLISECONDS ，
+ * basetime 参数则总是毫秒格式的。
+ */
+void expireGenericCommand(redisClient *c, long long basetime, int unit) {
+    robj *key = c->argv[1], *param = c->argv[2];
+    long long when; /* unix time in milliseconds when the key will expire. */
+
+    // 取出 when 参数
+    if (getLongLongFromObjectOrReply(c, param, &when, NULL) != REDIS_OK)
+        return;
+
+    // 如果传入的过期时间是以秒为单位的，那么将它转换为毫秒
+    if (unit == UNIT_SECONDS) when *= 1000;
+    when += basetime;
+
+    /* No key, return zero. */
+    // 取出键
+    if (lookupKeyRead(c->db,key) == NULL) {
+        addReply(c,shared.czero);
+        return;
+    }
+
+    /* 
+     * 在载入数据时，或者服务器为附属节点时，
+     * 即使 EXPIRE 的 TTL 为负数，或者 EXPIREAT 提供的时间戳已经过期，
+     * 服务器也不会主动删除这个键，而是等待主节点发来显式的 DEL 命令。
+     *
+     * 程序会继续将（一个可能已经过期的 TTL）设置为键的过期时间，
+     * 并且等待主节点发来 DEL 命令。
+     */
+    if (when <= mstime() && !server.loading && !server.masterhost) {
+
+        // when 提供的时间已经过期，服务器为主节点，并且没在载入数据
+
+        robj *aux;
+
+        redisAssertWithInfo(c,key,dbDelete(c->db,key));
+        server.dirty++;
+        // 传播 DEL 命令
+        aux = createStringObject("DEL",3);
+        rewriteClientCommandVector(c,2,aux,key);
+        decrRefCount(aux);
+        signalModifiedKey(c->db,key);
+        notifyKeyspaceEvent(REDIS_NOTIFY_GENERIC,"del",key,c->db->id);
+        addReply(c, shared.cone);
+        return;
+    } else {
+        // 设置键的过期时间
+        // 如果服务器为附属节点，或者服务器正在载入，
+        // 那么这个 when 有可能已经过期的
+        setExpire(c->db,key,when);
+        addReply(c,shared.cone);
+        signalModifiedKey(c->db,key);
+        notifyKeyspaceEvent(REDIS_NOTIFY_GENERIC,"expire",key,c->db->id);
+        server.dirty++;
+        return;
+    }
+}
+
+```
+
+## 11.3 过期键的删除策略
+
+- 被动删除机制——惰性删除
+- 主动删除机制——定期删除
+
+这两种删除机制下,如果内存满了需要释放,会走Redis的内存淘汰机制
+
+### 11.3.1 惰性删除
+
+惰性删除: 放任过期键不管,但是每次从键空间获取建时,都检查取得的键是否过期,如果过期就删除该键,如果没过期就返回该键
+
+优点:对CPU时间来说最友好
+
+缺点:对内存最不友好,占用的内存一直不释放
+
+
+
+实现代码：
+
+```c
+#file: src/db.c
+/*
+ * 检查 key 是否已经过期，如果是的话，将它从数据库中删除。
+ * 返回 0 表示键没有过期时间，或者键未过期。
+ * 返回 1 表示键已经因为过期而被删除了。
+ */
+int expireIfNeeded(redisDb *db, robj *key) {
+    // 取出键的过期时间
+    mstime_t when = getExpire(db,key);
+    mstime_t now;
+    // 没有过期时间
+    if (when < 0) return 0; /* No expire for this key */
+
+    // 如果服务器正在进行载入，那么不进行任何过期检查
+    if (server.loading) return 0;
+
+
+    now = server.lua_caller ? server.lua_time_start : mstime();
+
+    // 当服务器运行在 replication 模式时
+    // 附属节点并不主动删除 key
+    // 它只返回一个逻辑上正确的返回值
+    // 真正的删除操作要等待主节点发来删除命令时才执行
+    // 从而保证数据的同步
+    if (server.masterhost != NULL) return now > when;
+
+    // 运行到这里，表示键带有过期时间，并且服务器为主节点
+
+    // 如果未过期，返回 0
+    if (now <= when) return 0;
+
+    /* Delete the key */
+    server.stat_expiredkeys++;
+
+    // 向 AOF 文件和附属节点传播过期信息
+    propagateExpire(db,key);
+
+    // 发送事件通知
+    notifyKeyspaceEvent(REDIS_NOTIFY_EXPIRED,
+        "expired",key,db->id);
+    // 将过期键从数据库中删除
+    return dbDelete(db,key);
+}
+```
+
+
+
+### 11.3.2 定期删除
+
+定期删除:每隔一段时间,程序就会对数据库进行检查,删除里面的过期键，定期删除通过限制删除操作执行的时长和频率来减少删除操作对CPU的影响，通过定期删除可以有效的减少因为过期键而带来的内存浪费
+
+定期删除策略是通过redis指定周期性函数`serverCron`时,调用对数据库执行的各种操作`databasesCron`,`databasesCron`调用`redis.c/activeExpireCycle`函数实现的,serverCron的调用频率是10HZ,所以定期删除`每100ms执行一次
+
+> server.hz = 10 一秒钟执行10次
+>
+> serverCron---->databasesCron----->activeExpireCycle
+
+
+
+```c
+#file: src/redis.c
+
+/* 
+ * 函数尝试删除数据库中已经过期的键。
+ * 当带有过期时间的键比较少时，函数运行得比较保守，
+ * 如果带有过期时间的键比较多，那么函数会以更积极的方式来删除过期键，
+ * 从而可能地释放被过期键占用的内存。
+ *
+ * 每次循环中被测试的数据库数目不会超过 REDIS_DBCRON_DBS_PER_CALL　默认16 。
+ *
+ *
+ * 如果 timelimit_exit 为真，那么说明还有更多删除工作要做，
+ * 那么在 beforeSleep() 函数调用时，程序会再次执行这个函数。
+ *
+ *
+ * 过期循环的类型：
+ *
+ * 如果循环的类型为 ACTIVE_EXPIRE_CYCLE_FAST ，
+ * 那么函数会以“快速过期”模式执行，
+ * 执行的时间不会长过 EXPIRE_FAST_CYCLE_DURATION 毫秒，
+ * 并且在 EXPIRE_FAST_CYCLE_DURATION 毫秒之内不会再重新执行。
+ *
+ * 如果循环的类型为 ACTIVE_EXPIRE_CYCLE_SLOW ，
+ * 那么函数会以“正常过期”模式执行，
+ * 函数的执行时限为 REDIS_HS 常量的一个百分比，
+ * 这个百分比由 REDIS_EXPIRELOOKUPS_TIME_PERC 定义。
+ */
+
+void activeExpireCycle(int type) {
+    // 静态变量，用来累积函数连续执行时的数据
+    static unsigned int current_db = 0; /* Last DB tested. */
+    static int timelimit_exit = 0;      /* Time limit hit in previous call? */
+    static long long last_fast_cycle = 0; /* When last fast cycle ran. */
+
+    unsigned int j, iteration = 0;
+    // 默认每次处理的数据库数量
+    unsigned int dbs_per_call = REDIS_DBCRON_DBS_PER_CALL;
+    // 函数开始的时间
+    long long start = ustime(), timelimit;
+
+    // 快速模式
+    if (type == ACTIVE_EXPIRE_CYCLE_FAST) {
+        // 如果上次函数没有触发 timelimit_exit ，那么不执行处理
+        if (!timelimit_exit) return;
+        // 如果距离上次执行未够一定时间，那么不执行处理
+        if (start < last_fast_cycle + ACTIVE_EXPIRE_CYCLE_FAST_DURATION*2) return;
+        // 运行到这里，说明执行快速处理，记录当前时间
+        last_fast_cycle = start;
+    }
+
+    /* 
+     * 一般情况下，函数只处理 REDIS_DBCRON_DBS_PER_CALL 个数据库，
+     * 除非：
+     *
+     * 1) 当前数据库的数量小于 REDIS_DBCRON_DBS_PER_CALL
+     * 2) 如果上次处理遇到了时间上限，那么这次需要对所有数据库进行扫描，
+     *     这可以避免过多的过期键占用空间
+     */
+    if (dbs_per_call > server.dbnum || timelimit_exit)
+        dbs_per_call = server.dbnum;
+
+
+    // 函数处理的微秒时间上限
+    // ACTIVE_EXPIRE_CYCLE_SLOW_TIME_PERC 默认为 25 ，也即是 25 % 的 CPU 时间
+    timelimit = 1000000*ACTIVE_EXPIRE_CYCLE_SLOW_TIME_PERC/server.hz/100;
+    timelimit_exit = 0;
+    if (timelimit <= 0) timelimit = 1;
+
+    // 如果是运行在快速模式之下
+    // 那么最多只能运行 FAST_DURATION 微秒 
+    // 默认值为 1000 （微秒）
+    if (type == ACTIVE_EXPIRE_CYCLE_FAST)
+        timelimit = ACTIVE_EXPIRE_CYCLE_FAST_DURATION; /* in microseconds. */
+
+    // 遍历数据库
+    for (j = 0; j < dbs_per_call; j++) {
+        int expired;
+        // 指向要处理的数据库
+        redisDb *db = server.db+(current_db % server.dbnum);
+
+        // 为 DB 计数器加一，如果进入 do 循环之后因为超时而跳出
+        // 那么下次会直接从下个 DB 开始处理
+        current_db++;
+
+        do {
+            unsigned long num, slots;
+            long long now, ttl_sum;
+            int ttl_samples;
+            // 获取数据库中带过期时间的键的数量
+            // 如果该数量为 0 ，直接跳过这个数据库
+            if ((num = dictSize(db->expires)) == 0) {
+                db->avg_ttl = 0;
+                break;
+            }
+            // 获取数据库中键值对的数量
+            slots = dictSlots(db->expires);
+            // 当前时间
+            now = mstime();
+
+            // 这个数据库的使用率低于 1% ，扫描起来太费力了（大部分都会 MISS）
+            // 跳过，等待字典收缩程序运行
+            if (num && slots > DICT_HT_INITIAL_SIZE &&
+                (num*100/slots < 1)) break;
+
+            /*
+             * 样本计数器
+             */
+            // 已处理过期键计数器
+            expired = 0;
+            // 键的总 TTL 计数器
+            ttl_sum = 0;
+            // 总共处理的键计数器
+            ttl_samples = 0;
+
+            // 每次最多只能检查 LOOKUPS_PER_LOOP 个键
+            if (num > ACTIVE_EXPIRE_CYCLE_LOOKUPS_PER_LOOP)
+                num = ACTIVE_EXPIRE_CYCLE_LOOKUPS_PER_LOOP;
+
+            // 开始遍历数据库
+            while (num--) {
+                dictEntry *de;
+                long long ttl;
+                // 从 expires 中随机取出一个带过期时间的键
+                if ((de = dictGetRandomKey(db->expires)) == NULL) break;
+                // 计算 TTL
+                ttl = dictGetSignedIntegerVal(de)-now;
+                // 如果键已经过期，那么删除它，并将 expired 计数器增一
+                if (activeExpireCycleTryExpire(db,de,now)) expired++;
+                if (ttl < 0) ttl = 0;
+                // 累积键的 TTL
+                ttl_sum += ttl;
+                // 累积处理键的个数
+                ttl_samples++;
+            }
+
+            // 为这个数据库更新平均 TTL 统计数据
+            if (ttl_samples) {
+                // 计算当前平均值
+                long long avg_ttl = ttl_sum/ttl_samples;
+                
+                // 如果这是第一次设置数据库平均 TTL ，那么进行初始化
+                if (db->avg_ttl == 0) db->avg_ttl = avg_ttl;
+                /* Smooth the value averaging with the previous one. */
+                // 取数据库的上次平均 TTL 和今次平均 TTL 的平均值
+                db->avg_ttl = (db->avg_ttl+avg_ttl)/2;
+            }
+
+            // 我们不能用太长时间处理过期键，
+            // 所以这个函数执行一定时间之后就要返回
+
+            // 更新遍历次数
+            iteration++;
+
+            // 每遍历 16 次执行一次
+            if ((iteration & 0xf) == 0 && /* check once every 16 iterations. */
+                (ustime()-start) > timelimit)
+            {
+                // 如果遍历次数正好是 16 的倍数
+                // 并且遍历的时间超过了 timelimit
+                // 那么断开 timelimit_exit
+                timelimit_exit = 1;
+            }
+
+            // 已经超时了，返回
+            if (timelimit_exit) return;
+
+            // 如果已删除的过期键占当前总数据库带过期时间的键数量的 25 %
+            // 那么不再遍历
+        } while (expired > ACTIVE_EXPIRE_CYCLE_LOOKUPS_PER_LOOP/4);
+    }
+}
+```
+
+
+
+1. 设置每次遍历数据库数量的最大值:REDIS_DBCRON_DBS_PER_CALL(16)个
+2. 设置运行的最长时间:
+   - slow模式下最多运行25000微秒＝1000000*ACTIVE_EXPIRE_CYCLE_SLOW_TIME_PERC/server.hz/100
+   - fast模式下最多运行1000微妙＝ACTIVE_EXPIRE_CYCLE_FAST_DURATION
+3. 设置每遍历一个数据库最多取ACTIVE_EXPIRE_CYCLE_LOOKUPS_PER_LOOP(20)个键值
+4. 如果已删除的过期键占当前总数据库带过期时间的键数量的 25 %不再进行遍历
+
+
+
+## 11.4 内存淘汰机制
+
+如果定期删除漏掉了很多键，惰性删除也没有进行,Redis会使用内存淘汰机制来释放内存
+
+- noeviction：当内存不足以容纳新写入数据时，新写入操作会报错。`默认策略`
+
+- allkeys-lru：当内存不足以容纳新写入数据时，在键空间中，移除最近最少使用的key。
+
+- allkeys-random：当内存不足以容纳新写入数据时，在键空间中，随机移除某个key。
+
+- volatile-lru：当内存不足以容纳新写入数据时，在设置了过期时间的键空间中，移除最近最少使用的key。
+
+- volatile-random：当内存不足以容纳新写入数据时，在设置了过期时间的键空间中，随机移除某个key。
+
+- volatile-ttl：当内存不足以容纳新写入数据时，在设置了过期时间的键空间中，有更早过期时间的key优先移除。
+
+- allkey-lfu: 获取所有key的访问频度删除访问最少的key
+
+- volatile-lfu:获取过期key的访问频度删除访问最少的key
+
+  
+
+  > 如何选取合适的策略？
+  >
+  > 比较推荐的是两种lru策略。根据自己的业务需求。如果你使用Redis只是作为缓存，不作为DB持久化，那推荐选择allkeys-lru；如果你使用Redis同时用于缓存和数据持久化，那推荐选择volatile-lru。
+
+
+
+```ini
+#file : redis.conf
+# MAXMEMORY POLICY: how Redis will select what to remove when maxmemory
+# is reached. You can select among five behaviors:
+# 
+# volatile-lru -> remove the key with an expire set using an LRU algorithm
+# allkeys-lru -> remove any key accordingly to the LRU algorithm
+# volatile-random -> remove a random key with an expire set
+# allkeys-random -> remove a random key, any key
+# volatile-ttl -> remove the key with the nearest expire time (minor TTL)
+# noeviction -> don't expire at all, just return an error on write operations
+#
+# The default is:
+# maxmemory-policy noeviction
+```
+
+
+## 11.5 LRU算法
+
+### 11.5.1 什么是LRU
+
+就是一种缓存淘汰策略。
+
+计算机的缓存容量有限，如果缓存满了就要删除一些内容，给新内容腾位置。但问题是，删除哪些内容呢？我们肯定希望删掉哪些没什么用的缓存，而把有用的数据继续留在缓存里，方便之后继续使用。那么，什么样的数据，我们判定为「有用的」的数据呢？
+
+LRU 缓存淘汰算法就是一种常用策略。LRU 的全称是 Least Recently Used，也就是说我们认为最近使用过的数据应该是是「有用的」，很久都没用过的数据应该是无用的，内存满了就优先删那些很久没用过的数据。
+
+
+
+### 11.5.2 LRU的实现
+
+LRU 算法实际上是让你设计数据结构：首先要接收一个 capacity 参数作为缓存的最大容量，然后实现两个 API，一个是 put(key, val) 方法存入键值对，另一个是 get(key) 方法获取 key 对应的 val，如果 key 不存在则返回 -1。get 和 put 方法必须都是 O(1) 的时间复杂度
+
+常用的方式是构造一个结构体包含一个HashMap和双链表
+
+HashMap做取数据使用
+
+双链表存访问的顺序
+
+![](http://cache410.oss-cn-beijing.aliyuncs.com/LRU.png)
+
+
+
+我们看下go语言实现的LRU
+
+```go
+type (
+	LRUCache struct {
+		Capacity int
+		HashMap  map[int]*Node
+		Head     *Node
+		Last     *Node
+	}
+	Node struct {
+		Val  int
+		Key  int
+		Pre  *Node
+		Next *Node
+	}
+)
+
+
+func Constructor(capacity int) LRUCache {
+	cache := LRUCache{
+		Capacity: capacity,
+		HashMap:  make(map[int]*Node, capacity),
+		Head:     &Node{},
+		Last:     &Node{},
+	}
+	cache.Head.Next = cache.Last
+	cache.Last.Pre = cache.Head
+	return cache
+}
+
+func (this *LRUCache) Get(key int) int {
+	node, ok := this.HashMap[key]
+	if !ok {
+		return -1
+	}
+	this.remove(node)
+	this.setHead(node)
+	return node.Val
+}
+
+func (this *LRUCache) Put(key int, value int) {
+	node, ok := this.HashMap[key]
+	if ok {
+		node.Val = value
+		this.remove(node)
+	} else {
+		if len(this.HashMap) == this.Capacity {
+			delete(this.HashMap, this.Last.Pre.Key)
+			this.remove(this.Last.Pre)
+		}
+		node = &Node{
+			Val:  value,
+			Key:  key,
+			Pre:  nil,
+			Next: nil,
+		}
+		this.HashMap[node.Key] = node
+	}
+	this.setHead(node)
+
+}
+
+func (this *LRUCache) setHead(node *Node) {
+	this.Head.Next.Pre = node
+	node.Next = this.Head.Next
+	this.Head.Next = node
+	node.Pre = this.Head
+}
+
+func (this *LRUCache) remove(node *Node) {
+	node.Pre.Next = node.Next
+	node.Next.Pre = node.Pre
+}
+
+/*============================*/
+
+/*
+使用方法
+ * obj := Constructor(capacity);
+ * param_1 := obj.Get(key);
+ * obj.Put(key,value);
+ */
+```
+
+
+
+### 11.5.3 Redis LRU的实现
+
+
+
+```c
+# file: src/redis.c
+int freeMemoryIfNeeded(void) {
+
+......
+/* volatile-lru and allkeys-lru policy */
+            // 如果使用的是 LRU 策略，
+            // 那么从一集 sample 键中选出 IDLE 时间最长的那个键
+            else if (server.maxmemory_policy == REDIS_MAXMEMORY_ALLKEYS_LRU ||
+                server.maxmemory_policy == REDIS_MAXMEMORY_VOLATILE_LRU)
+            {
+                struct evictionPoolEntry *pool = db->eviction_pool;
+
+                while(bestkey == NULL) {
+                    evictionPoolPopulate(dict, db->dict, db->eviction_pool);
+                    /* Go backward from best to worst element to evict. */
+                    for (k = REDIS_EVICTION_POOL_SIZE-1; k >= 0; k--) {
+                        if (pool[k].key == NULL) continue;
+                        de = dictFind(dict,pool[k].key);
+
+                        /* Remove the entry from the pool. */
+                        sdsfree(pool[k].key);
+                        /* Shift all elements on its right to left. */
+                        memmove(pool+k,pool+k+1,
+                            sizeof(pool[0])*(REDIS_EVICTION_POOL_SIZE-k-1));
+                        /* Clear the element on the right which is empty
+                         * since we shifted one position to the left.  */
+                        pool[REDIS_EVICTION_POOL_SIZE-1].key = NULL;
+                        pool[REDIS_EVICTION_POOL_SIZE-1].idle = 0;
+
+                        /* If the key exists, is our pick. Otherwise it is
+                         * a ghost and we need to try the next element. */
+                        if (de) {
+                            bestkey = dictGetKey(de);
+                            break;
+                        } else {
+                            /* Ghost... */
+                            continue;
+                        }
+                    }
+                }
+            }
+......
+    
+    
+/* This is an helper function for freeMemoryIfNeeded(), it is used in order
+ * to populate the evictionPool with a few entries every time we want to
+ * expire a key. Keys with idle time smaller than one of the current
+ * keys are added. Keys are always added if there are free entries.
+ *
+ * We insert keys on place in ascending order, so keys with the smaller
+ * idle time are on the left, and keys with the higher idle time on the
+ * right. */
+
+#define EVICTION_SAMPLES_ARRAY_SIZE 16
+void evictionPoolPopulate(dict *sampledict, dict *keydict, struct evictionPoolEntry *pool) {
+    int j, k, count;
+    dictEntry *_samples[EVICTION_SAMPLES_ARRAY_SIZE];
+    dictEntry **samples;
+
+    /* Try to use a static buffer: this function is a big hit...
+     * Note: it was actually measured that this helps. */
+    if (server.maxmemory_samples <= EVICTION_SAMPLES_ARRAY_SIZE) {
+        samples = _samples;
+    } else {
+        samples = zmalloc(sizeof(samples[0])*server.maxmemory_samples);
+    }
+
+#if 1 /* Use bulk get by default. */
+    count = dictGetRandomKeys(sampledict,samples,server.maxmemory_samples);
+#else
+    count = server.maxmemory_samples;
+    for (j = 0; j < count; j++) samples[j] = dictGetRandomKey(sampledict);
+#endif
+
+    for (j = 0; j < count; j++) {
+        unsigned long long idle;
+        sds key;
+        robj *o;
+        dictEntry *de;
+
+        de = samples[j];
+        key = dictGetKey(de);
+        /* If the dictionary we are sampling from is not the main
+         * dictionary (but the expires one) we need to lookup the key
+         * again in the key dictionary to obtain the value object. */
+        if (sampledict != keydict) de = dictFind(keydict, key);
+        o = dictGetVal(de);
+        idle = estimateObjectIdleTime(o);
+
+        /* Insert the element inside the pool.
+         * First, find the first empty bucket or the first populated
+         * bucket that has an idle time smaller than our idle time. */
+        k = 0;
+        while (k < REDIS_EVICTION_POOL_SIZE &&
+               pool[k].key &&
+               pool[k].idle < idle) k++;
+        if (k == 0 && pool[REDIS_EVICTION_POOL_SIZE-1].key != NULL) {
+            /* Can't insert if the element is < the worst element we have
+             * and there are no empty buckets. */
+            continue;
+        } else if (k < REDIS_EVICTION_POOL_SIZE && pool[k].key == NULL) {
+            /* Inserting into empty position. No setup needed before insert. */
+        } else {
+            /* Inserting in the middle. Now k points to the first element
+             * greater than the element to insert.  */
+            if (pool[REDIS_EVICTION_POOL_SIZE-1].key == NULL) {
+                /* Free space on the right? Insert at k shifting
+                 * all the elements from k to end to the right. */
+                memmove(pool+k+1,pool+k,
+                    sizeof(pool[0])*(REDIS_EVICTION_POOL_SIZE-k-1));
+            } else {
+                /* No free space on right? Insert at k-1 */
+                k--;
+                /* Shift all elements on the left of k (included) to the
+                 * left, so we discard the element with smaller idle time. */
+                sdsfree(pool[0].key);
+                memmove(pool,pool+1,sizeof(pool[0])*k);
+            }
+        }
+        pool[k].key = sdsdup(key);
+        pool[k].idle = idle;
+    }
+    if (samples != _samples) zfree(samples);
+}
+
+/* This is a version of dictGetRandomKey() that is modified in order to
+ * return multiple entries by jumping at a random place of the hash table
+ * and scanning linearly for entries.
+ *
+ * Returned pointers to hash table entries are stored into 'des' that
+ * points to an array of dictEntry pointers. The array must have room for
+ * at least 'count' elements, that is the argument we pass to the function
+ * to tell how many random elements we need.
+ *
+ * The function returns the number of items stored into 'des', that may
+ * be less than 'count' if the hash table has less than 'count' elements
+ * inside.
+ *
+ * Note that this function is not suitable when you need a good distribution
+ * of the returned items, but only when you need to "sample" a given number
+ * of continuous elements to run some kind of algorithm or to produce
+ * statistics. However the function is much faster than dictGetRandomKey()
+ * at producing N elements, and the elements are guaranteed to be non
+ * repeating. */
+int dictGetRandomKeys(dict *d, dictEntry **des, int count) {
+    int j; /* internal hash table id, 0 or 1. */
+    int stored = 0;
+
+    if (dictSize(d) < count) count = dictSize(d);
+    while(stored < count) {
+        for (j = 0; j < 2; j++) {
+            /* Pick a random point inside the hash table 0 or 1. */
+            unsigned int i = random() & d->ht[j].sizemask;
+            int size = d->ht[j].size;
+
+            /* Make sure to visit every bucket by iterating 'size' times. */
+            while(size--) {
+                dictEntry *he = d->ht[j].table[i];
+                while (he) {
+                    /* Collect all the elements of the buckets found non
+                     * empty while iterating. */
+                    *des = he;
+                    des++;
+                    he = he->next;
+                    stored++;
+                    if (stored == count) return stored;
+                }
+                i = (i+1) & d->ht[j].sizemask;
+            }
+            /* If there is only one table and we iterated it all, we should
+             * already have 'count' elements. Assert this condition. */
+            assert(dictIsRehashing(d) != 0);
+        }
+    }
+    return stored; /* Never reached. */
+}
+
+    
+typedef struct redisDb {
+......
+    struct evictionPoolEntry *eviction_pool;    /* Eviction pool of keys */
+......
+} redisDb;
+    
+typedef struct redisObject {
+......
+    // 对象最后一次被访问的时间
+    unsigned lru:REDIS_LRU_BITS; /* lru time (relative to server.lruclock)
+......
+} robj;
+
+
+```
+
+
+
+![](http://cache410.oss-cn-beijing.aliyuncs.com/LRUDuring.png)
+

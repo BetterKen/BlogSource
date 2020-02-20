@@ -1,0 +1,1288 @@
+---
+title: 10.Redis数据结构——object
+date: 2020-02-20 17:23:16
+tags:
+    - Redis
+    - 缓存
+categories:
+    - 中间件
+    - Redis
+---
+
+## 10.1 什么是object
+
+在前面的数个章节里， 我们陆续介绍了 Redis 用到的所有主要数据结构， 比如简单动态字符串（SDS）、双端链表、字典、压缩列表、整数集合， 等等。
+
+Redis 并没有直接使用这些数据结构来实现键值对数据库， 而是基于这些数据结构创建了一个`对象系统`， 这个系统包含字符串对象、列表对象、哈希对象、集合对象和有序集合对象这五种类型的对象， 每种对象都用到了至少一种我们前面所介绍的数据结构。
+
+通过这五种不同类型的对象， Redis 可以在执行命令之前， 根据对象的类型来判断一个对象是否可以执行给定的命令。 使用对象的另一个好处是， 我们可以针对不同的使用场景， 为对象设置多种不同的数据结构实现， 从而优化对象在不同场景下的使用效率
+
+
+
+## 10.2 数据结构
+
+```c
+#file : src/redis.c
+typedef struct redisObject {
+    // 类型
+    unsigned type:4;
+    // 编码
+    unsigned encoding:4;
+    // 对象最后一次被访问的时间
+    unsigned lru:REDIS_LRU_BITS; /* lru time (relative to server.lruclock) */
+    // 引用计数
+    int refcount;
+    // 指向实际值的指针
+    void *ptr;
+} robj;
+```
+
+Redis 使用对象来表示数据库中的键和值， 每次当我们在 Redis 的数据库中新创建一个键值对时， 我们至少会创建两个对象， 一个对象用作键值对的键（键对象）， 另一个对象用作键值对的值（值对象）。
+
+
+
+### 10.2.1 type
+
+对象的 type 属性记录了对象的类型:
+
+```c
+#file : src/redis.c
+// 对象类型
+#define REDIS_STRING 0  #字符串对象 "string"
+#define REDIS_LIST 1    #列表对象 "list"
+#define REDIS_SET 2     #哈希对象 "hash"
+#define REDIS_ZSET 3    #集合对象 "set"
+#define REDIS_HASH 4    #有序集合对象 "zset"
+```
+
+
+
+### 10.2.2 encoding
+
+对象的 ptr 指针指向对象的底层实现数据结构， 而这些数据结构由对象的 encoding 属性决定。
+
+encoding 属性记录了对象所使用的编码， 也即是说这个对象使用了什么数据结构作为对象的底层实现:
+
+```c
+#file : src/redis.c
+// 对象编码
+#简单动态字符串
+#define REDIS_ENCODING_RAW 0     /* Raw representation */ #long 类型的整数
+#long 类型的整数
+#define REDIS_ENCODING_INT 1     /* Encoded as integer */
+#字典
+#define REDIS_ENCODING_HT 2      /* Encoded as hash table */
+#压缩字典
+#define REDIS_ENCODING_ZIPMAP 3  /* Encoded as zipmap */
+#双端链表
+#define REDIS_ENCODING_LINKEDLIST 4 /* Encoded as regular linked list */
+#压缩列表
+#define REDIS_ENCODING_ZIPLIST 5 /* Encoded as ziplist */
+#整数集合
+#define REDIS_ENCODING_INTSET 6  /* Encoded as intset */
+#跳表
+#define REDIS_ENCODING_SKIPLIST 7  /* Encoded as skiplist */
+#embstr编码的简单动态字符串
+#define REDIS_ENCODING_EMBSTR 8  /* Embedded sds string encoding */
+```
+
+## 10.3 Redis键的底层实现
+
+对于 Redis 数据库保存的键值对来说， 键总是一个字符串对象， 而值则可以是字符串对象、列表对象、哈希对象、集合对象或者有序集合对象的其中一种
+
+## 10.4 Redis值的底层实现
+
+### 10.4.1 字符串对象
+
+```c
+#file: src/t_string.c
+
+/* SET key value [NX] [XX] [EX <seconds>] [PX <milliseconds>] */
+void setCommand(redisClient *c) {
+    int j;
+    robj *expire = NULL;
+    int unit = UNIT_SECONDS;
+    int flags = REDIS_SET_NO_FLAGS;
+
+    // 设置选项参数
+    for (j = 3; j < c->argc; j++) {
+        char *a = c->argv[j]->ptr;
+        robj *next = (j == c->argc-1) ? NULL : c->argv[j+1];
+
+        if ((a[0] == 'n' || a[0] == 'N') &&
+            (a[1] == 'x' || a[1] == 'X') && a[2] == '\0') {
+            flags |= REDIS_SET_NX;
+        } else if ((a[0] == 'x' || a[0] == 'X') &&
+                   (a[1] == 'x' || a[1] == 'X') && a[2] == '\0') {
+            flags |= REDIS_SET_XX;
+        } else if ((a[0] == 'e' || a[0] == 'E') &&
+                   (a[1] == 'x' || a[1] == 'X') && a[2] == '\0' && next) {
+            unit = UNIT_SECONDS;
+            expire = next;
+            j++;
+        } else if ((a[0] == 'p' || a[0] == 'P') &&
+                   (a[1] == 'x' || a[1] == 'X') && a[2] == '\0' && next) {
+            unit = UNIT_MILLISECONDS;
+            expire = next;
+            j++;
+        } else {
+            addReply(c,shared.syntaxerr);
+            return;
+        }
+    }
+
+    // 尝试对值对象进行编码
+    c->argv[2] = tryObjectEncoding(c->argv[2]);
+
+    setGenericCommand(c,flags,c->argv[1],c->argv[2],expire,unit,NULL,NULL);
+}
+
+void setnxCommand(redisClient *c) {
+    c->argv[2] = tryObjectEncoding(c->argv[2]);
+    setGenericCommand(c,REDIS_SET_NX,c->argv[1],c->argv[2],NULL,0,shared.cone,shared.czero);
+}
+
+void setexCommand(redisClient *c) {
+    c->argv[3] = tryObjectEncoding(c->argv[3]);
+    setGenericCommand(c,REDIS_SET_NO_FLAGS,c->argv[1],c->argv[3],c->argv[2],UNIT_SECONDS,NULL,NULL);
+}
+
+void psetexCommand(redisClient *c) {
+    c->argv[3] = tryObjectEncoding(c->argv[3]);
+    setGenericCommand(c,REDIS_SET_NO_FLAGS,c->argv[1],c->argv[3],c->argv[2],UNIT_MILLISECONDS,NULL,NULL);
+}
+
+
+void setGenericCommand(redisClient *c, int flags, robj *key, robj *val, robj *expire, int unit, robj *ok_reply, robj *abort_reply) {
+
+    long long milliseconds = 0; /* initialized to avoid any harmness warning */
+
+    // 取出过期时间
+    if (expire) {
+
+        // 取出 expire 参数的值
+        // T = O(N)
+        if (getLongLongFromObjectOrReply(c, expire, &milliseconds, NULL) != REDIS_OK)
+            return;
+
+        // expire 参数的值不正确时报错
+        if (milliseconds <= 0) {
+            addReplyError(c,"invalid expire time in SETEX");
+            return;
+        }
+
+        // 不论输入的过期时间是秒还是毫秒
+        // Redis 实际都以毫秒的形式保存过期时间
+        // 如果输入的过期时间为秒，那么将它转换为毫秒
+        if (unit == UNIT_SECONDS) milliseconds *= 1000;
+    }
+
+    // 如果设置了 NX 或者 XX 参数，那么检查条件是否不符合这两个设置
+    // 在条件不符合时报错，报错的内容由 abort_reply 参数决定
+    if ((flags & REDIS_SET_NX && lookupKeyWrite(c->db,key) != NULL) ||
+        (flags & REDIS_SET_XX && lookupKeyWrite(c->db,key) == NULL))
+    {
+        addReply(c, abort_reply ? abort_reply : shared.nullbulk);
+        return;
+    }
+
+    // 将键值关联到数据库
+    setKey(c->db,key,val);
+
+    // 将数据库设为脏
+    server.dirty++;
+
+    // 为键设置过期时间
+    if (expire) setExpire(c->db,key,mstime()+milliseconds);
+
+    // 发送事件通知
+    notifyKeyspaceEvent(REDIS_NOTIFY_STRING,"set",key,c->db->id);
+
+    // 发送事件通知
+    if (expire) notifyKeyspaceEvent(REDIS_NOTIFY_GENERIC,
+        "expire",key,c->db->id);
+    // 设置成功，向客户端发送回复
+    // 回复的内容由 ok_reply 决定
+    addReply(c, ok_reply ? ok_reply : shared.ok);
+}
+
+#file:src/object
+
+// 尝试对字符串对象进行编码，以节约内存。
+robj *tryObjectEncoding(robj *o) {
+    long value;
+
+    sds s = o->ptr;
+    size_t len;
+
+    redisAssertWithInfo(NULL,o,o->type == REDIS_STRING);
+
+    // 只在字符串的编码为 RAW 或者 EMBSTR 时尝试进行编码
+    if (!sdsEncodedObject(o)) return o;
+
+     // 不对共享对象进行编码
+     if (o->refcount > 1) return o;
+
+    // 对字符串进行检查
+    // 只对长度小于或等于 21 字节，并且可以被解释为整数的字符串进行编码
+    len = sdslen(s);
+    if (len <= 21 && string2l(s,len,&value)) {
+
+        if (server.maxmemory == 0 &&
+            value >= 0 &&
+            value < REDIS_SHARED_INTEGERS)
+        {
+            decrRefCount(o);
+            incrRefCount(shared.integers[value]);
+            return shared.integers[value];
+        } else {
+            if (o->encoding == REDIS_ENCODING_RAW) sdsfree(o->ptr);
+            o->encoding = REDIS_ENCODING_INT;
+            o->ptr = (void*) value;
+            return o;
+        }
+    }
+
+    // 尝试将 RAW 编码的字符串编码为 EMBSTR 编码
+    if (len <= REDIS_ENCODING_EMBSTR_SIZE_LIMIT) {
+        robj *emb;
+
+        if (o->encoding == REDIS_ENCODING_EMBSTR) return o;
+        emb = createEmbeddedStringObject(s,sdslen(s));
+        decrRefCount(o);
+        return emb;
+    }
+
+    // 这个对象没办法进行编码，尝试从 SDS 中移除所有空余空间
+    if (o->encoding == REDIS_ENCODING_RAW &&
+        sdsavail(s) > len/10)
+    {
+        o->ptr = sdsRemoveFreeSpace(o->ptr);
+    }
+
+    /* Return the original object. */
+    return o;
+}
+```
+
+![](http://cache410.oss-cn-beijing.aliyuncs.com/stringadd.png)
+
+
+
+### 10.4.2 列表对象
+
+```c
+# file : src/t_list.c
+
+void lpushxCommand(redisClient *c) {
+    c->argv[2] = tryObjectEncoding(c->argv[2]);
+    pushxGenericCommand(c,NULL,c->argv[2],REDIS_HEAD);
+}
+
+void rpushxCommand(redisClient *c) {
+    c->argv[2] = tryObjectEncoding(c->argv[2]);
+    pushxGenericCommand(c,NULL,c->argv[2],REDIS_TAIL);
+}
+
+void pushxGenericCommand(redisClient *c, robj *refval, robj *val, int where) {
+    robj *subject;
+    listTypeIterator *iter;
+    listTypeEntry entry;
+    int inserted = 0;
+
+    // 取出列表对象
+    if ((subject = lookupKeyReadOrReply(c,c->argv[1],shared.czero)) == NULL ||
+        checkType(c,subject,REDIS_LIST)) return;
+
+    // 执行的是 LINSERT 命令
+    if (refval != NULL) {
+        // 看保存值 value 是否需要将列表编码转换为双端链表
+        listTypeTryConversion(subject,val);
+
+        /* Seek refval from head to tail */
+        // 在列表中查找 refval 对象
+        iter = listTypeInitIterator(subject,0,REDIS_TAIL);
+        while (listTypeNext(iter,&entry)) {
+            if (listTypeEqual(&entry,refval)) {
+                // 找到了，将值插入到节点的前面或后面
+                listTypeInsert(&entry,val,where);
+                inserted = 1;
+                break;
+            }
+        }
+        listTypeReleaseIterator(iter);
+
+        if (inserted) {
+            /* Check if the length exceeds the ziplist length threshold. */
+            // 查看插入之后是否需要将编码转换为双端链表
+            if (subject->encoding == REDIS_ENCODING_ZIPLIST &&
+                ziplistLen(subject->ptr) > server.list_max_ziplist_entries)
+                    listTypeConvert(subject,REDIS_ENCODING_LINKEDLIST);
+
+            signalModifiedKey(c->db,c->argv[1]);
+
+            notifyKeyspaceEvent(REDIS_NOTIFY_LIST,"linsert",
+                                c->argv[1],c->db->id);
+            server.dirty++;
+        } else {
+            /* Notify client of a failed insert */
+            // refval 不存在，插入失败
+            addReply(c,shared.cnegone);
+            return;
+        }
+
+    // 执行的是 LPUSHX 或 RPUSHX 命令
+    } else {
+        char *event = (where == REDIS_HEAD) ? "lpush" : "rpush";
+
+        listTypePush(subject,val,where);
+
+        signalModifiedKey(c->db,c->argv[1]);
+
+        notifyKeyspaceEvent(REDIS_NOTIFY_LIST,event,c->argv[1],c->db->id);
+
+        server.dirty++;
+    }
+
+    addReplyLongLong(c,listTypeLength(subject));
+}
+
+
+/*
+ * 将给定元素添加到列表的表头或表尾。
+ *
+ * 参数 where 决定了新元素添加的位置：
+ *
+ *  - REDIS_HEAD 将新元素添加到表头
+ *  - REDIS_TAIL 将新元素添加到表尾
+ *
+ * 调用者无须担心 value 的引用计数，因为这个函数会负责这方面的工作。
+ */
+void listTypePush(robj *subject, robj *value, int where) {
+
+    /* Check if we need to convert the ziplist */
+    // 是否需要转换编码？
+    listTypeTryConversion(subject,value);
+
+    if (subject->encoding == REDIS_ENCODING_ZIPLIST &&
+        ziplistLen(subject->ptr) >= server.list_max_ziplist_entries)
+            listTypeConvert(subject,REDIS_ENCODING_LINKEDLIST);
+
+    // ZIPLIST
+    if (subject->encoding == REDIS_ENCODING_ZIPLIST) {
+        int pos = (where == REDIS_HEAD) ? ZIPLIST_HEAD : ZIPLIST_TAIL;
+        // 取出对象的值，因为 ZIPLIST 只能保存字符串或整数
+        value = getDecodedObject(value);
+        subject->ptr = ziplistPush(subject->ptr,value->ptr,sdslen(value->ptr),pos);
+        decrRefCount(value);
+
+    // 双端链表
+    } else if (subject->encoding == REDIS_ENCODING_LINKEDLIST) {
+        if (where == REDIS_HEAD) {
+            listAddNodeHead(subject->ptr,value);
+        } else {
+            listAddNodeTail(subject->ptr,value);
+        }
+        incrRefCount(value);
+
+    // 未知编码
+    } else {
+        redisPanic("Unknown list encoding");
+    }
+}
+/*
+ * 对输入值 value 进行检查，看是否需要将 subject 从 ziplist 转换为双端链表，
+ * 以便保存值 value 。
+ *
+ * 函数只对 REDIS_ENCODING_RAW 编码的 value 进行检查，
+ * 因为整数编码的值不可能超长。
+ */
+void listTypeTryConversion(robj *subject, robj *value) {
+
+    // 确保 subject 为 ZIPLIST 编码
+    if (subject->encoding != REDIS_ENCODING_ZIPLIST) return;
+
+    if (sdsEncodedObject(value) &&
+        // 看字符串是否过长
+        sdslen(value->ptr) > server.list_max_ziplist_value)
+            // 将编码转换为双端链表
+            listTypeConvert(subject,REDIS_ENCODING_LINKEDLIST);
+}
+/*
+ * 将列表的底层编码从 ziplist 转换成双端链表
+ */
+void listTypeConvert(robj *subject, int enc) {
+
+    listTypeIterator *li;
+    listTypeEntry entry;
+    redisAssertWithInfo(NULL,subject,subject->type == REDIS_LIST);
+
+    // 转换成双端链表
+    if (enc == REDIS_ENCODING_LINKEDLIST) {
+
+        list *l = listCreate();
+
+        listSetFreeMethod(l,decrRefCountVoid);
+
+        // 遍历 ziplist ，并将里面的值全部添加到双端链表中
+        li = listTypeInitIterator(subject,0,REDIS_TAIL);
+        while (listTypeNext(li,&entry)) listAddNodeTail(l,listTypeGet(&entry));
+        listTypeReleaseIterator(li);
+
+        // 更新编码
+        subject->encoding = REDIS_ENCODING_LINKEDLIST;
+
+        // 释放原来的 ziplist
+        zfree(subject->ptr);
+
+        // 更新对象值指针
+        subject->ptr = l;
+
+    } else {
+        redisPanic("Unsupported list conversion");
+    }
+}
+
+
+#file : src/object.c
+/*
+ * 创建一个 ZIPLIST 编码的列表对象
+ */
+robj *createZiplistObject(void) {
+
+    unsigned char *zl = ziplistNew();
+
+    robj *o = createObject(REDIS_LIST,zl);
+
+    o->encoding = REDIS_ENCODING_ZIPLIST;
+
+    return o;
+}
+
+```
+
+![](http://cache410.oss-cn-beijing.aliyuncs.com/listadd.png)
+
+
+
+
+
+### 10.4.3 哈希对象
+
+```c
+#file src/t_hash.c
+
+/*-----------------------------------------------------------------------------
+ * Hash type commands
+ *----------------------------------------------------------------------------*/
+
+void hsetCommand(redisClient *c) {
+    int update;
+    robj *o;
+    // 取出或新创建哈希对象
+    if ((o = hashTypeLookupWriteOrCreate(c,c->argv[1])) == NULL) return;
+    // 如果需要的话，转换哈希对象的编码
+    hashTypeTryConversion(o,c->argv,2,3);
+    // 编码 field 和 value 对象以节约空间
+    hashTypeTryObjectEncoding(o,&c->argv[2], &c->argv[3]);
+    // 设置 field 和 value 到 hash
+    update = hashTypeSet(o,c->argv[2],c->argv[3]);
+    // 返回状态：显示 field-value 对是新添加还是更新
+    addReply(c, update ? shared.czero : shared.cone);
+    // 发送键修改信号
+    signalModifiedKey(c->db,c->argv[1]);
+    // 发送事件通知
+    notifyKeyspaceEvent(REDIS_NOTIFY_HASH,"hset",c->argv[1],c->db->id);
+    // 将服务器设为脏
+    server.dirty++;
+}
+
+void hsetnxCommand(redisClient *c) {
+    robj *o;
+    // 取出或新创建哈希对象
+    if ((o = hashTypeLookupWriteOrCreate(c,c->argv[1])) == NULL) return;
+    // 如果需要的话，转换哈希对象的编码
+    hashTypeTryConversion(o,c->argv,2,3);
+    // 如果 field-value 对已经存在
+    // 那么回复 0 
+    if (hashTypeExists(o, c->argv[2])) {
+        addReply(c, shared.czero);
+    // 否则，设置 field-value 对
+    } else {
+        // 对 field 和 value 对象编码，以节省空间
+        hashTypeTryObjectEncoding(o,&c->argv[2], &c->argv[3]);
+        // 设置
+        hashTypeSet(o,c->argv[2],c->argv[3]);
+        // 回复 1 ，表示设置成功
+        addReply(c, shared.cone);
+        // 发送键修改信号
+        signalModifiedKey(c->db,c->argv[1]);
+        // 发送事件通知
+        notifyKeyspaceEvent(REDIS_NOTIFY_HASH,"hset",c->argv[1],c->db->id);
+       // 将数据库设为脏
+        server.dirty++;
+    }
+}
+
+void hmsetCommand(redisClient *c) {
+    int i;
+    robj *o;
+    // field-value 参数必须成对出现
+    if ((c->argc % 2) == 1) {
+        addReplyError(c,"wrong number of arguments for HMSET");
+        return;
+    }
+    // 取出或新创建哈希对象
+    if ((o = hashTypeLookupWriteOrCreate(c,c->argv[1])) == NULL) return;
+    // 如果需要的话，转换哈希对象的编码
+    hashTypeTryConversion(o,c->argv,2,c->argc-1);
+    // 遍历并设置所有 field-value 对
+    for (i = 2; i < c->argc; i += 2) {
+        // 编码 field-value 对，以节约空间
+        hashTypeTryObjectEncoding(o,&c->argv[i], &c->argv[i+1]);
+        // 设置
+        hashTypeSet(o,c->argv[i],c->argv[i+1]);
+    }
+    // 向客户端发送回复
+    addReply(c, shared.ok);
+    // 发送键修改信号
+    signalModifiedKey(c->db,c->argv[1]);
+    // 发送事件通知
+    notifyKeyspaceEvent(REDIS_NOTIFY_HASH,"hset",c->argv[1],c->db->id);
+    // 将数据库设为脏
+    server.dirty++;
+}
+
+/*
+ * 对 argv 数组中的多个对象进行检查，
+ * 看是否需要将对象的编码从 REDIS_ENCODING_ZIPLIST 转换成 REDIS_ENCODING_HT
+ *
+ * 注意程序只检查字符串值，因为它们的长度可以在常数时间内取得。
+ */
+void hashTypeTryConversion(robj *o, robj **argv, int start, int end) {
+    int i;
+
+    // 如果对象不是 ziplist 编码，那么直接返回
+    if (o->encoding != REDIS_ENCODING_ZIPLIST) return;
+
+    // 检查所有输入对象，看它们的字符串值是否超过了指定长度
+    for (i = start; i <= end; i++) {
+        if (sdsEncodedObject(argv[i]) &&
+            sdslen(argv[i]->ptr) > server.hash_max_ziplist_value)
+        {
+            // 将对象的编码转换成 REDIS_ENCODING_HT
+            hashTypeConvert(o, REDIS_ENCODING_HT);
+            break;
+        }
+    }
+}
+
+/*
+ * 对哈希对象 o 的编码方式进行转换
+ *
+ * 目前只支持将 ZIPLIST 编码转换成 HT 编码
+ */
+void hashTypeConvert(robj *o, int enc) {
+
+    if (o->encoding == REDIS_ENCODING_ZIPLIST) {
+        hashTypeConvertZiplist(o, enc);
+
+    } else if (o->encoding == REDIS_ENCODING_HT) {
+        redisPanic("Not implemented");
+
+    } else {
+        redisPanic("Unknown hash encoding");
+    }
+}
+/* 
+ * 将给定的 field-value 对添加到 hash 中，
+ * 如果 field 已经存在，那么删除旧的值，并关联新值。
+ * 这个函数负责对 field 和 value 参数进行引用计数自增。
+ *
+ * 返回 0 表示元素已经存在，这次函数调用执行的是更新操作。
+ * 返回 1 则表示函数执行的是新添加操作。
+ */
+int hashTypeSet(robj *o, robj *field, robj *value) {
+    int update = 0;
+
+    // 添加到 ziplist
+    if (o->encoding == REDIS_ENCODING_ZIPLIST) {
+        unsigned char *zl, *fptr, *vptr;
+
+        // 解码成字符串或者数字
+        field = getDecodedObject(field);
+        value = getDecodedObject(value);
+
+        // 遍历整个 ziplist ，尝试查找并更新 field （如果它已经存在的话）
+        zl = o->ptr;
+        fptr = ziplistIndex(zl, ZIPLIST_HEAD);
+        if (fptr != NULL) {
+            // 定位到域 field
+            fptr = ziplistFind(fptr, field->ptr, sdslen(field->ptr), 1);
+            if (fptr != NULL) {
+                /* Grab pointer to the value (fptr points to the field) */
+                // 定位到域的值
+                vptr = ziplistNext(zl, fptr);
+                redisAssert(vptr != NULL);
+
+                // 标识这次操作为更新操作
+                update = 1;
+
+                /* Delete value */
+                // 删除旧的键值对
+                zl = ziplistDelete(zl, &vptr);
+
+                /* Insert new value */
+                // 添加新的键值对
+                zl = ziplistInsert(zl, vptr, value->ptr, sdslen(value->ptr));
+            }
+        }
+
+        // 如果这不是更新操作，那么这就是一个添加操作
+        if (!update) {
+            /* Push new field/value pair onto the tail of the ziplist */
+            // 将新的 field-value 对推入到 ziplist 的末尾
+            zl = ziplistPush(zl, field->ptr, sdslen(field->ptr), ZIPLIST_TAIL);
+            zl = ziplistPush(zl, value->ptr, sdslen(value->ptr), ZIPLIST_TAIL);
+        }
+        
+        // 更新对象指针
+        o->ptr = zl;
+
+        // 释放临时对象
+        decrRefCount(field);
+        decrRefCount(value);
+
+        // 检查在添加操作完成之后，是否需要将 ZIPLIST 编码转换成 HT 编码
+        if (hashTypeLength(o) > server.hash_max_ziplist_entries)
+            hashTypeConvert(o, REDIS_ENCODING_HT);
+
+    // 添加到字典
+    } else if (o->encoding == REDIS_ENCODING_HT) {
+
+        // 添加或替换键值对到字典
+        // 添加返回 1 ，替换返回 0
+        if (dictReplace(o->ptr, field, value)) { /* Insert */
+            incrRefCount(field);
+        } else { /* Update */
+            update = 1;
+        }
+
+        incrRefCount(value);
+    } else {
+        redisPanic("Unknown hash encoding");
+    }
+
+    // 更新/添加指示变量
+    return update;
+}
+
+
+#file: src/object.c
+/*
+ * 创建一个 ZIPLIST 编码的哈希对象
+ */
+robj *createHashObject(void) {
+    unsigned char *zl = ziplistNew();
+    robj *o = createObject(REDIS_HASH, zl);
+    o->encoding = REDIS_ENCODING_ZIPLIST;
+    return o;
+}
+```
+
+![](http://cache410.oss-cn-beijing.aliyuncs.com/hashadd.png)
+
+
+
+### 10.4.4 集合对象
+
+```c
+#file: src/t_set.c
+void saddCommand(redisClient *c) {
+    robj *set;
+    int j, added = 0;
+
+    // 取出集合对象
+    set = lookupKeyWrite(c->db,c->argv[1]);
+
+    // 对象不存在，创建一个新的，并将它关联到数据库
+    if (set == NULL) {
+        set = setTypeCreate(c->argv[2]);
+        dbAdd(c->db,c->argv[1],set);
+
+    // 对象存在，检查类型
+    } else {
+        if (set->type != REDIS_SET) {
+            addReply(c,shared.wrongtypeerr);
+            return;
+        }
+    }
+
+    // 将所有输入元素添加到集合中
+    for (j = 2; j < c->argc; j++) {
+        c->argv[j] = tryObjectEncoding(c->argv[j]);
+        // 只有元素未存在于集合时，才算一次成功添加
+        if (setTypeAdd(set,c->argv[j])) added++;
+    }
+
+    // 如果有至少一个元素被成功添加，那么执行以下程序
+    if (added) {
+        // 发送键修改信号
+        signalModifiedKey(c->db,c->argv[1]);
+        // 发送事件通知
+        notifyKeyspaceEvent(REDIS_NOTIFY_SET,"sadd",c->argv[1],c->db->id);
+    }
+
+    // 将数据库设为脏
+    server.dirty += added;
+
+    // 返回添加元素的数量
+    addReplyLongLong(c,added);
+}
+/* 
+ * 返回一个可以保存值 value 的集合。
+ * 当对象的值可以被编码为整数时，返回 intset ，
+ * 否则，返回普通的哈希表。
+ */
+
+robj *setTypeCreate(robj *value) {
+
+    if (isObjectRepresentableAsLongLong(value,NULL) == REDIS_OK)
+        return createIntsetObject();
+
+    return createSetObject();
+}
+/* 
+ * 将集合对象 setobj 的编码转换为 REDIS_ENCODING_HT 。
+ *
+ * 新创建的结果字典会被预先分配为和原来的集合一样大。
+ */
+void setTypeConvert(robj *setobj, int enc) {
+
+    setTypeIterator *si;
+
+    // 确认类型和编码正确
+    redisAssertWithInfo(NULL,setobj,setobj->type == REDIS_SET &&
+                             setobj->encoding == REDIS_ENCODING_INTSET);
+
+    if (enc == REDIS_ENCODING_HT) {
+        int64_t intele;
+        // 创建新字典
+        dict *d = dictCreate(&setDictType,NULL);
+        robj *element;
+
+        /* Presize the dict to avoid rehashing */
+        // 预先扩展空间
+        dictExpand(d,intsetLen(setobj->ptr));
+
+        /* To add the elements we extract integers and create redis objects */
+        // 遍历集合，并将元素添加到字典中
+        si = setTypeInitIterator(setobj);
+        while (setTypeNext(si,NULL,&intele) != -1) {
+            element = createStringObjectFromLongLong(intele);
+            redisAssertWithInfo(NULL,element,dictAdd(d,element,NULL) == DICT_OK);
+        }
+        setTypeReleaseIterator(si);
+
+        // 更新集合的编码
+        setobj->encoding = REDIS_ENCODING_HT;
+        zfree(setobj->ptr);
+        // 更新集合的值对象
+        setobj->ptr = d;
+    } else {
+        redisPanic("Unsupported set conversion");
+    }
+}
+/*
+ * 多态 add 操作
+ *
+ * 添加成功返回 1 ，如果元素已经存在，返回 0 。
+ */
+int setTypeAdd(robj *subject, robj *value) {
+    long long llval;
+
+    // 字典
+    if (subject->encoding == REDIS_ENCODING_HT) {
+        // 将 value 作为键， NULL 作为值，将元素添加到字典中
+        if (dictAdd(subject->ptr,value,NULL) == DICT_OK) {
+            incrRefCount(value);
+            return 1;
+        }
+
+    // intset
+    } else if (subject->encoding == REDIS_ENCODING_INTSET) {
+        
+        // 如果对象的值可以编码为整数的话，那么将对象的值添加到 intset 中
+        if (isObjectRepresentableAsLongLong(value,&llval) == REDIS_OK) {
+            uint8_t success = 0;
+            subject->ptr = intsetAdd(subject->ptr,llval,&success);
+            if (success) {
+                /* Convert to regular set when the intset contains
+                 * too many entries. */
+                // 添加成功
+                // 检查集合在添加新元素之后是否需要转换为字典
+                if (intsetLen(subject->ptr) > server.set_max_intset_entries)
+                    setTypeConvert(subject,REDIS_ENCODING_HT);
+                return 1;
+            }
+
+        // 如果对象的值不能编码为整数，那么将集合从 intset 编码转换为 HT 编码
+        // 然后再执行添加操作
+        } else {
+            /* Failed to get integer from object, convert to regular set. */
+            setTypeConvert(subject,REDIS_ENCODING_HT);
+
+            /* The set *was* an intset and this value is not integer
+             * encodable, so dictAdd should always work. */
+            redisAssertWithInfo(NULL,value,dictAdd(subject->ptr,value,NULL) == DICT_OK);
+            incrRefCount(value);
+            return 1;
+        }
+
+    // 未知编码
+    } else {
+        redisPanic("Unknown set encoding");
+    }
+
+    // 添加失败，元素已经存在
+    return 0;
+}
+
+#file: src/db.c
+/*
+ * 为执行写入操作而取出键 key 在数据库 db 中的值。
+ * 和 lookupKeyRead 不同，这个函数不会更新服务器的命中/不命中信息。
+ * 找到时返回值对象，没找到返回 NULL 。
+ */
+robj *lookupKeyWrite(redisDb *db, robj *key) {
+
+    // 删除过期键
+    expireIfNeeded(db,key);
+
+    // 查找并返回 key 的值对象
+    return lookupKey(db,key);
+}
+
+```
+
+![](http://cache410.oss-cn-beijing.aliyuncs.com/setadd.png)
+
+
+
+### 10.4.5 有序集合对象
+
+```c
+#file : src/t_zset.c
+void zaddCommand(redisClient *c) {
+    zaddGenericCommand(c,0);
+}
+
+void zincrbyCommand(redisClient *c) {
+    zaddGenericCommand(c,1);
+}
+
+/* This generic command implements both ZADD and ZINCRBY. */
+void zaddGenericCommand(redisClient *c, int incr) {
+
+    static char *nanerr = "resulting score is not a number (NaN)";
+
+    robj *key = c->argv[1];
+    robj *ele;
+    robj *zobj;
+    robj *curobj;
+    double score = 0, *scores = NULL, curscore = 0.0;
+    int j, elements = (c->argc-2)/2;
+    int added = 0, updated = 0;
+
+    // 输入的 score - member 参数必须是成对出现的
+    if (c->argc % 2) {
+        addReply(c,shared.syntaxerr);
+        return;
+    }
+
+    // 取出所有输入的 score 分值
+    scores = zmalloc(sizeof(double)*elements);
+    for (j = 0; j < elements; j++) {
+        if (getDoubleFromObjectOrReply(c,c->argv[2+j*2],&scores[j],NULL)
+            != REDIS_OK) goto cleanup;
+    }
+
+    /* Lookup the key and create the sorted set if does not exist. */
+    // 取出有序集合对象
+    zobj = lookupKeyWrite(c->db,key);
+    if (zobj == NULL) {
+        // 有序集合不存在，创建新有序集合
+        if (server.zset_max_ziplist_entries == 0 ||
+            server.zset_max_ziplist_value < sdslen(c->argv[3]->ptr))
+        {
+            zobj = createZsetObject();
+        } else {
+            zobj = createZsetZiplistObject();
+        }
+        // 关联对象到数据库
+        dbAdd(c->db,key,zobj);
+    } else {
+        // 对象存在，检查类型
+        if (zobj->type != REDIS_ZSET) {
+            addReply(c,shared.wrongtypeerr);
+            goto cleanup;
+        }
+    }
+
+    // 处理所有元素
+    for (j = 0; j < elements; j++) {
+        score = scores[j];
+
+        // 有序集合为 ziplist 编码
+        if (zobj->encoding == REDIS_ENCODING_ZIPLIST) {
+            unsigned char *eptr;
+
+            /* Prefer non-encoded element when dealing with ziplists. */
+            // 查找成员
+            ele = c->argv[3+j*2];
+            if ((eptr = zzlFind(zobj->ptr,ele,&curscore)) != NULL) {
+
+                // 成员已存在
+
+                // ZINCRYBY 命令时使用
+                if (incr) {
+                    score += curscore;
+                    if (isnan(score)) {
+                        addReplyError(c,nanerr);
+                        goto cleanup;
+                    }
+                }
+                // 执行 ZINCRYBY 命令时，
+                // 或者用户通过 ZADD 修改成员的分值时执行
+                if (score != curscore) {
+                    // 删除已有元素
+                    zobj->ptr = zzlDelete(zobj->ptr,eptr);
+                    // 重新插入元素
+                    zobj->ptr = zzlInsert(zobj->ptr,ele,score);
+                    // 计数器
+                    server.dirty++;
+                    updated++;
+                }
+            } else {
+                // 元素不存在，直接添加
+                zobj->ptr = zzlInsert(zobj->ptr,ele,score);
+
+                // 查看元素的数量，
+                // 看是否需要将 ZIPLIST 编码转换为有序集合
+                if (zzlLength(zobj->ptr) > server.zset_max_ziplist_entries)
+                    zsetConvert(zobj,REDIS_ENCODING_SKIPLIST);
+
+                // 查看新添加元素的长度
+                // 看是否需要将 ZIPLIST 编码转换为有序集合
+                if (sdslen(ele->ptr) > server.zset_max_ziplist_value)
+                    zsetConvert(zobj,REDIS_ENCODING_SKIPLIST);
+
+                server.dirty++;
+                added++;
+            }
+
+        // 有序集合为 SKIPLIST 编码
+        } else if (zobj->encoding == REDIS_ENCODING_SKIPLIST) {
+            zset *zs = zobj->ptr;
+            zskiplistNode *znode;
+            dictEntry *de;
+
+            // 编码对象
+            ele = c->argv[3+j*2] = tryObjectEncoding(c->argv[3+j*2]);
+
+            // 查看成员是否存在
+            de = dictFind(zs->dict,ele);
+            if (de != NULL) {
+
+                // 成员存在
+
+                // 取出成员
+                curobj = dictGetKey(de);
+                // 取出分值
+                curscore = *(double*)dictGetVal(de);
+
+                // ZINCRYBY 时执行
+                if (incr) {
+                    score += curscore;
+                    if (isnan(score)) {
+                        addReplyError(c,nanerr);
+                        /* Don't need to check if the sorted set is empty
+                         * because we know it has at least one element. */
+                        goto cleanup;
+                    }
+                }
+
+                // 执行 ZINCRYBY 命令时，
+                // 或者用户通过 ZADD 修改成员的分值时执行
+                if (score != curscore) {
+                    // 删除原有元素
+                    redisAssertWithInfo(c,curobj,zslDelete(zs->zsl,curscore,curobj));
+
+                    // 重新插入元素
+                    znode = zslInsert(zs->zsl,score,curobj);
+                    incrRefCount(curobj); /* Re-inserted in skiplist. */
+
+                    // 更新字典的分值指针
+                    dictGetVal(de) = &znode->score; /* Update score ptr. */
+
+                    server.dirty++;
+                    updated++;
+                }
+            } else {
+
+                // 元素不存在，直接添加到跳跃表
+                znode = zslInsert(zs->zsl,score,ele);
+                incrRefCount(ele); /* Inserted in skiplist. */
+
+                // 将元素关联到字典
+                redisAssertWithInfo(c,NULL,dictAdd(zs->dict,ele,&znode->score) == DICT_OK);
+                incrRefCount(ele); /* Added to dictionary. */
+
+                server.dirty++;
+                added++;
+            }
+        } else {
+            redisPanic("Unknown sorted set encoding");
+        }
+    }
+
+    if (incr) /* ZINCRBY */
+        addReplyDouble(c,score);
+    else /* ZADD */
+        addReplyLongLong(c,added);
+
+cleanup:
+    zfree(scores);
+    if (added || updated) {
+        signalModifiedKey(c->db,key);
+        notifyKeyspaceEvent(REDIS_NOTIFY_ZSET,
+            incr ? "zincr" : "zadd", key, c->db->id);
+    }
+}
+
+
+/*
+ * 将跳跃表对象 zobj 的底层编码转换为 encoding 。
+ */
+void zsetConvert(robj *zobj, int encoding) {
+    zset *zs;
+    zskiplistNode *node, *next;
+    robj *ele;
+    double score;
+
+    if (zobj->encoding == encoding) return;
+
+    // 从 ZIPLIST 编码转换为 SKIPLIST 编码
+    if (zobj->encoding == REDIS_ENCODING_ZIPLIST) {
+        unsigned char *zl = zobj->ptr;
+        unsigned char *eptr, *sptr;
+        unsigned char *vstr;
+        unsigned int vlen;
+        long long vlong;
+
+        if (encoding != REDIS_ENCODING_SKIPLIST)
+            redisPanic("Unknown target encoding");
+
+        // 创建有序集合结构
+        zs = zmalloc(sizeof(*zs));
+        // 字典
+        zs->dict = dictCreate(&zsetDictType,NULL);
+        // 跳跃表
+        zs->zsl = zslCreate();
+
+        // 有序集合在 ziplist 中的排列：
+        //
+        // | member-1 | score-1 | member-2 | score-2 | ... |
+        //
+        // 指向 ziplist 中的首个节点（保存着元素成员）
+        eptr = ziplistIndex(zl,0);
+        redisAssertWithInfo(NULL,zobj,eptr != NULL);
+        // 指向 ziplist 中的第二个节点（保存着元素分值）
+        sptr = ziplistNext(zl,eptr);
+        redisAssertWithInfo(NULL,zobj,sptr != NULL);
+
+        // 遍历所有 ziplist 节点，并将元素的成员和分值添加到有序集合中
+        while (eptr != NULL) {
+            
+            // 取出分值
+            score = zzlGetScore(sptr);
+
+            // 取出成员
+            redisAssertWithInfo(NULL,zobj,ziplistGet(eptr,&vstr,&vlen,&vlong));
+            if (vstr == NULL)
+                ele = createStringObjectFromLongLong(vlong);
+            else
+                ele = createStringObject((char*)vstr,vlen);
+
+            /* Has incremented refcount since it was just created. */
+            // 将成员和分值分别关联到跳跃表和字典中
+            node = zslInsert(zs->zsl,score,ele);
+            redisAssertWithInfo(NULL,zobj,dictAdd(zs->dict,ele,&node->score) == DICT_OK);
+            incrRefCount(ele); /* Added to dictionary. */
+
+            // 移动指针，指向下个元素
+            zzlNext(zl,&eptr,&sptr);
+        }
+
+        // 释放原来的 ziplist
+        zfree(zobj->ptr);
+
+        // 更新对象的值，以及编码方式
+        zobj->ptr = zs;
+        zobj->encoding = REDIS_ENCODING_SKIPLIST;
+
+    // 从 SKIPLIST 转换为 ZIPLIST 编码
+    } else if (zobj->encoding == REDIS_ENCODING_SKIPLIST) {
+
+        // 新的 ziplist
+        unsigned char *zl = ziplistNew();
+
+        if (encoding != REDIS_ENCODING_ZIPLIST)
+            redisPanic("Unknown target encoding");
+
+        /* Approach similar to zslFree(), since we want to free the skiplist at
+         * the same time as creating the ziplist. */
+        // 指向跳跃表
+        zs = zobj->ptr;
+
+        // 先释放字典，因为只需要跳跃表就可以遍历整个有序集合了
+        dictRelease(zs->dict);
+
+        // 指向跳跃表首个节点
+        node = zs->zsl->header->level[0].forward;
+
+        // 释放跳跃表表头
+        zfree(zs->zsl->header);
+        zfree(zs->zsl);
+
+        // 遍历跳跃表，取出里面的元素，并将它们添加到 ziplist
+        while (node) {
+
+            // 取出解码后的值对象
+            ele = getDecodedObject(node->obj);
+
+            // 添加元素到 ziplist
+            zl = zzlInsertAt(zl,NULL,ele,node->score);
+            decrRefCount(ele);
+
+            // 沿着跳跃表的第 0 层前进
+            next = node->level[0].forward;
+            zslFreeNode(node);
+            node = next;
+        }
+
+        // 释放跳跃表
+        zfree(zs);
+
+        // 更新对象的值，以及对象的编码方式
+        zobj->ptr = zl;
+        zobj->encoding = REDIS_ENCODING_ZIPLIST;
+    } else {
+        redisPanic("Unknown sorted set encoding");
+    }
+}
+
+```
+
+![](http://cache410.oss-cn-beijing.aliyuncs.com/zsetadd.png)
+
+
+
+## 10.5 内存回收
+
+因为 C 语言并不具备自动的内存回收功能， 所以 Redis 在自己的对象系统中构建了一个引用计数（reference counting）技术实现的内存回收机制， 通过这一机制， 程序可以通过跟踪对象的引用计数信息， 在适当的时候自动释放对象并进行内存回收。
+
+每个对象的引用计数信息由 redisObject 结构的 refcount 属性记录
+
+对象的引用计数信息会随着对象的使用状态而不断变化：
+
+- 在创建一个新对象时， 引用计数的值会被初始化为 1 ；
+- 当对象被一个新程序使用时， 它的引用计数值会被增一；
+- 当对象不再被一个程序使用时， 它的引用计数值会被减一；
+- 当对象的引用计数值变为 0 时， 对象所占用的内存会被释放。
+
+
+
+操作refcount的函数:
+
+```c
+#file: src/object.c
+#incrRefCount 将对象的引用计数值增一。
+#decrRefCount 将对象的引用计数值减一，当对象的引用计数值等于0时，释放对象。
+#resetRefCount 将对象的引用计数值设置为0，但并不释放对象，这个函数通常在需要重新设置对象的引用计数值时使用
+
+/*
+ * 为对象的引用计数增一
+ */
+void incrRefCount(robj *o) {
+    o->refcount++;
+}
+
+/*
+ * 为对象的引用计数减一
+ * 当对象的引用计数降为 0 时，释放对象。
+ */
+void decrRefCount(robj *o) {
+
+    if (o->refcount <= 0) redisPanic("decrRefCount against refcount <= 0");
+
+    // 释放对象
+    if (o->refcount == 1) {
+        switch(o->type) {
+        case REDIS_STRING: freeStringObject(o); break;
+        case REDIS_LIST: freeListObject(o); break;
+        case REDIS_SET: freeSetObject(o); break;
+        case REDIS_ZSET: freeZsetObject(o); break;
+        case REDIS_HASH: freeHashObject(o); break;
+        default: redisPanic("Unknown object type"); break;
+        }
+        zfree(o);
+
+    // 减少计数
+    } else {
+        o->refcount--;
+    }
+}
+robj *resetRefCount(robj *obj) {
+    obj->refcount = 0;
+    return obj;
+}
+```
+
+## 10.6 对象共享
+
+除了用于实现引用计数内存回收机制之外， 对象的引用计数属性还带有对象共享的作用。
+
+在 Redis 中， 让多个键共享同一个值对象需要执行以下两个步骤：
+
+1. 将数据库键的值指针指向一个现有的值对象；
+2. 将被共享的值对象的引用计数增一。
+
+目前来说， Redis 会在初始化服务器时， 创建一万个字符串对象， 这些对象包含了`从 0 到 9999 的所有整数值`， 当服务器需要用到值为 0 到 9999 的字符串对象时， 服务器就会使用这些共享对象， 而不是新创建对象。
+
+`【注意】redis只对包含整数值的字符串对象进行共享。`
+> 尽管共享更复杂的对象可以节约更多的内存，但验证共享对象和目标对象是否相同所需的复杂度就会越高， 消耗的 CPU 时间也会越多
+
+## 10.7 对象空转时长
+
+redisObject 结构包含一个属性为 lru 属性， 该属性记录了对象最后一次被命令程序访问的时间：
+
+```c
+redis> SET foo "bar"
+OK
+redis> OBJECT IDLETIME foo
+(integer) 5
+redis> OBJECT IDLETIME foo
+(integer) 15
+redis> GET foo
+"bar"
+redis> OBJECT IDLETIME foo
+(integer) 5
+```
+
+如果服务器打开了 maxmemory 选项， 并且服务器用于回收内存的算法为 volatile-lru 或者 allkeys-lru ， 那么当服务器占用的内存数超过了 maxmemory 选项所设置的上限值时， 空转时长较高的那部分键会优先被服务器释放， 从而回收内存。
+
+
+
+
+
