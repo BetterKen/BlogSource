@@ -1,0 +1,93 @@
+---
+title:  8.ES集群分片与文档存储
+date: 2020-03-03 22:05:00
+tags:
+    - Elaticsearch
+categories:
+    - 中间件
+    - Elaticsearch
+---
+## 8.1 分片类型
+
+- 主分片
+- 副本分片
+
+### 8.1.1 Primary Shard
+
+- 通过主分⽚，将数据分布在所有节点上,**用来提升系统存储容量**
+- 可以将⼀份索引的数据，分散在多个 Data Node 上，**实现存储的⽔平扩展**
+- 主分⽚(Primary Shard)数在索引**创建时候指定，后续默认不能修改，如要修改，需重建索引**
+
+
+
+### 8.1.2 Replica Shard 
+
+- 通过引⼊副本分⽚ (Replica Shard) **提⾼数据的可⽤性**。⼀旦主分⽚丢失，副本分⽚可以 Promote 成主分⽚。副本分⽚数可以动态调整。每个节点上都有完备的数据。如果不设置副本分⽚，⼀旦出现节点硬件故障，就有可能造成数据丢失提升系统的读取性能
+- 副本分⽚由主分⽚(Primary Shard)同步。通过⽀持增加 Replica 个数，⼀定程度可以**提⾼读取的吞吐量**
+
+
+
+## 8.2 分片数设定
+
+- 主分⽚数过⼩：例如创建了 1 个 Primary Shard 的 Index
+- 如果该索引增⻓很快，集群⽆法通过增加节点实现对这个索引的数据扩展
+- 主分⽚数设置过⼤：导致单个 Shard 容量很⼩，引发⼀个节点上有过多分⽚，影响性能
+- 副本分⽚数设置过多，会降低集群整体的写⼊性能
+
+**总结**: 实在有太多相关的因素了：你使用的硬件、文档的大小和复杂度、文档的索引分析方式、运行的查询类型、执行的聚合以及你的数据模型等等。
+**建议设置Primary Shard数量为master node的数量的倍数,Primary Shard数量不能为0**
+
+
+
+## 8.3 新增节点分片转移过程
+
+![](http://dist415.oss-cn-beijing.aliyuncs.com/esshardzy.png)
+
+## 8.5 故障转移
+
+![](http://dist415.oss-cn-beijing.aliyuncs.com/esfailover.png)
+
+
+
+## 8.6 文档分布式储存
+
+**⽂档会存储在具体的某个主分⽚和副本分⽚上：例如 ⽂档 1， 会存储在 P0 和 R0 分⽚上**
+
+每个shard都是一个最小工作单元，承载部分数据，lucene实例，完整的建立索引和处理请求的能力
+
+![](http://dist415.oss-cn-beijing.aliyuncs.com/esfenpian.png)
+
+
+
+## 8.7 ⽂档到分⽚的路由算法
+
+> shard = hash(_routing) % number_of_primary_shards
+
+- Hash 算法确保⽂档均匀分散到分⽚中
+- 默认的 _routing 值是⽂档 id
+- 可以⾃⾏制定 routing数值，例如⽤相同国家的商品，都分配到指定的shard
+
+![](http://dist415.oss-cn-beijing.aliyuncs.com/eshashrouting.png)
+
+
+
+- 设置 Index Settings 后， **Primary 数不能随意修改的根本原因**
+
+
+
+## 8.8 更新一个文档
+
+![](http://dist415.oss-cn-beijing.aliyuncs.com/esdocupdate.png)
+
+1. 打到一台Coordinating node节点
+2. 根据路由算法找到存储文档的Primary shard
+3. 路由到指定shard
+4. 删除文档
+5. 新建文档
+6. 同步到replica shard成功
+7. 返回
+
+## 8.9 删除一个文档
+
+![](http://dist415.oss-cn-beijing.aliyuncs.com/esdocdel.png)
+
