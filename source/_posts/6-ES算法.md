@@ -1,5 +1,5 @@
 ---
-title:  6.ES算法
+title: 6.ES算法
 date: 2020-03-03 22:01:00
 tags:
     - Elaticsearch

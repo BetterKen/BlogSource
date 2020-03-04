@@ -1,5 +1,5 @@
 ---
-title:  8.ES集群分片与文档存储
+title: 8.ES集群分片与文档存储
 date: 2020-03-03 22:05:00
 tags:
     - Elaticsearch

@@ -1,5 +1,5 @@
 ---
-title:  7.ES分布式集群
+title: 7.ES分布式集群
 date: 2020-03-03 22:03:00
 tags:
     - Elaticsearch

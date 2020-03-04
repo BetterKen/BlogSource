@@ -1,5 +1,5 @@
 ---
-title:  5.ES Mapping介绍
+title: 5.ESMapping介绍
 date: 2020-03-03 22:00:00
 tags:
     - Elaticsearch
